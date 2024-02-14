@@ -125,19 +125,33 @@
 
 ## Compilation
 
+<<<<<<< HEAD
 ### Windows
 
 ```bash
+=======
+### Windows (PowerShell)
+
+```powershell
+$env:CGO_ENABLED=0
+>>>>>>> upstream/main
 go build -o xray.exe -trimpath -ldflags "-s -w -buildid=" ./main
 ```
 
 ### Linux / macOS
 
 ```bash
+<<<<<<< HEAD
 go build -o xray -trimpath -ldflags "-s -w -buildid=" ./main
 ```
 
 ### General
+=======
+CGO_ENABLED=0 go build -o xray -trimpath -ldflags "-s -w -buildid=" ./main
+```
+
+### Reproducible Releases
+>>>>>>> upstream/main
 
 ```bash
 make
