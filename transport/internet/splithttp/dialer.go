@@ -1,6 +1,7 @@
 package splithttp
 
 import (
+	"bytes"
 	"context"
 	gotls "crypto/tls"
 	"io"
@@ -14,8 +15,8 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/signal/semaphore"
 	"github.com/xtls/xray-core/common/uuid"
@@ -136,7 +137,7 @@ func init() {
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
-	newError("dialing splithttp to ", dest).WriteToLog(session.ExportIDToError(ctx))
+	errors.LogInfo(ctx, "dialing splithttp to ", dest)
 
 	var requestURL url.URL
 
@@ -191,7 +192,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			nil,
 		)
 		if err != nil {
-			newError("failed to construct download http request").Base(err).WriteToLog()
+			errors.LogInfoInner(ctx, err, "failed to construct download http request")
 			gotDownResponse.Close()
 			return
 		}
@@ -201,26 +202,31 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		response, err := httpClient.download.Do(req)
 		gotConn.Close()
 		if err != nil {
-			newError("failed to send download http request").Base(err).WriteToLog()
+			errors.LogInfoInner(ctx, err, "failed to send download http request")
 			gotDownResponse.Close()
 			return
 		}
 
 		if response.StatusCode != 200 {
 			response.Body.Close()
-			newError("invalid status code on download:", response.Status).WriteToLog()
+			errors.LogInfo(ctx, "invalid status code on download:", response.Status)
 			gotDownResponse.Close()
 			return
 		}
 
-		// skip "ok" response
-		trashHeader := []byte{0, 0}
-		_, err = io.ReadFull(response.Body, trashHeader)
-		if err != nil {
-			response.Body.Close()
-			newError("failed to read initial response").Base(err).WriteToLog()
-			gotDownResponse.Close()
-			return
+		// skip "ooooooooook" response
+		trashHeader := []byte{0}
+		for {
+			_, err = io.ReadFull(response.Body, trashHeader)
+			if err != nil {
+				response.Body.Close()
+				errors.LogInfoInner(ctx, err, "failed to read initial response")
+				gotDownResponse.Close()
+				return
+			}
+			if trashHeader[0] == 'k' {
+				break
+			}
 		}
 
 		downResponse = response.Body
@@ -253,51 +259,63 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				defer requestsLimiter.Signal()
 				req, err := http.NewRequest("POST", url, &buf.MultiBufferContainer{MultiBuffer: chunk})
 				if err != nil {
-					newError("failed to send upload").Base(err).WriteToLog()
+					errors.LogInfoInner(ctx, err, "failed to send upload")
 					uploadPipeReader.Interrupt()
 					return
 				}
 
+				req.ContentLength = int64(chunk.Len())
 				req.Header = transportConfiguration.GetRequestHeader()
 
 				if httpClient.isH2 {
 					resp, err := httpClient.upload.Do(req)
 					if err != nil {
-						newError("failed to send upload").Base(err).WriteToLog()
+						errors.LogInfoInner(ctx, err, "failed to send upload")
 						uploadPipeReader.Interrupt()
 						return
 					}
 					defer resp.Body.Close()
 
 					if resp.StatusCode != 200 {
-						newError("failed to send upload, bad status code:", resp.Status).WriteToLog()
+						errors.LogInfo(ctx, "failed to send upload, bad status code:", resp.Status)
 						uploadPipeReader.Interrupt()
 						return
 					}
 				} else {
-					var err error
 					var uploadConn any
-					for i := 0; i < 5; i++ {
+
+					// stringify the entire HTTP/1.1 request so it can be
+					// safely retried. if instead req.Write is called multiple
+					// times, the body is already drained after the first
+					// request
+					requestBytes := new(bytes.Buffer)
+					common.Must(req.Write(requestBytes))
+
+					for {
 						uploadConn = httpClient.uploadRawPool.Get()
-						if uploadConn == nil {
+						newConnection := uploadConn == nil
+						if newConnection {
 							uploadConn, err = httpClient.dialUploadConn(context.WithoutCancel(ctx))
 							if err != nil {
-								newError("failed to connect upload").Base(err).WriteToLog()
+								errors.LogInfoInner(ctx, err, "failed to connect upload")
 								uploadPipeReader.Interrupt()
 								return
 							}
 						}
 
-						err = req.Write(uploadConn.(net.Conn))
+						_, err = uploadConn.(net.Conn).Write(requestBytes.Bytes())
+
+						// if the write failed, we try another connection from
+						// the pool, until the write on a new connection fails.
+						// failed writes to a pooled connection are normal when
+						// the connection has been closed in the meantime.
 						if err == nil {
 							break
+						} else if newConnection {
+							errors.LogInfoInner(ctx, err, "failed to send upload")
+							uploadPipeReader.Interrupt()
+							return
 						}
-					}
-
-					if err != nil {
-						newError("failed to send upload").Base(err).WriteToLog()
-						uploadPipeReader.Interrupt()
-						return
 					}
 
 					httpClient.uploadRawPool.Put(uploadConn)
@@ -319,7 +337,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		CreateReader: func() (io.ReadCloser, error) {
 			<-gotDownResponse.Wait()
 			if downResponse == nil {
-				return nil, newError("downResponse failed")
+				return nil, errors.New("downResponse failed")
 			}
 			return downResponse, nil
 		},
