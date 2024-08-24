@@ -4,7 +4,7 @@ go 1.21.4
 
 require (
 	github.com/OmarTariq612/goech v0.0.0-20240405204721-8e2e1dafd3a0
-	github.com/cloudflare/circl v1.3.9
+	github.com/cloudflare/circl v1.4.0
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344
 	github.com/golang/mock v1.7.0-rc.1
 	github.com/google/go-cmp v0.6.0
@@ -19,7 +19,7 @@ require (
 	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771
 	github.com/stretchr/testify v1.9.0
 	github.com/v2fly/ss-bloomring v0.0.0-20210312155135-28617310f63e
-	github.com/vishvananda/netlink v1.2.1-beta.2.0.20230316163032-ced5aaba43e3
+	github.com/vishvananda/netlink v1.2.1
 	github.com/xtls/reality v0.0.0-20240712055506-48f0b2d5ed6d
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/crypto v0.26.0
