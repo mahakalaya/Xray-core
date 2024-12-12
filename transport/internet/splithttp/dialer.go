@@ -5,6 +5,7 @@ import (
 	gotls "crypto/tls"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"sync"
@@ -16,7 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/signal/semaphore"
+	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/browser_dialer"
@@ -249,7 +250,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
-	scMaxConcurrentPosts := transportConfiguration.GetNormalizedScMaxConcurrentPosts()
 	scMaxEachPostBytes := transportConfiguration.GetNormalizedScMaxEachPostBytes()
 	scMinPostsIntervalMs := transportConfiguration.GetNormalizedScMinPostsIntervalMs()
 
@@ -259,8 +259,14 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		requestURL.Scheme = "http"
 	}
 	requestURL.Host = transportConfiguration.Host
+	if requestURL.Host == "" && tlsConfig != nil {
+		requestURL.Host = tlsConfig.ServerName
+	}
+	if requestURL.Host == "" && realityConfig != nil {
+		requestURL.Host = realityConfig.ServerName
+	}
 	if requestURL.Host == "" {
-		requestURL.Host = dest.NetAddr()
+		requestURL.Host = dest.Address.String()
 	}
 
 	sessionIdUuid := uuid.New()
@@ -279,16 +285,25 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		globalDialerAccess.Unlock()
 		memory2 := streamSettings.DownloadSettings
-		httpClient2, muxRes2 = getHTTPClient(ctx, *memory2.Destination, memory2) // just panic
-		if tls.ConfigFromStreamSettings(memory2) != nil || reality.ConfigFromStreamSettings(memory2) != nil {
+		dest2 := *memory2.Destination // just panic
+		httpClient2, muxRes2 = getHTTPClient(ctx, dest2, memory2)
+		tlsConfig2 := tls.ConfigFromStreamSettings(memory2)
+		realityConfig2 := reality.ConfigFromStreamSettings(memory2)
+		if tlsConfig2 != nil || realityConfig2 != nil {
 			requestURL2.Scheme = "https"
 		} else {
 			requestURL2.Scheme = "http"
 		}
 		config2 := memory2.ProtocolSettings.(*Config)
 		requestURL2.Host = config2.Host
+		if requestURL2.Host == "" && tlsConfig2 != nil {
+			requestURL2.Host = tlsConfig2.ServerName
+		}
+		if requestURL2.Host == "" && realityConfig2 != nil {
+			requestURL2.Host = realityConfig2.ServerName
+		}
 		if requestURL2.Host == "" {
-			requestURL2.Host = memory2.Destination.NetAddr()
+			requestURL2.Host = dest2.Address.String()
 		}
 		requestURL2.Path = config2.GetNormalizedPath() + sessionIdUuid.String()
 		requestURL2.RawQuery = config2.GetNormalizedQuery()
@@ -371,54 +386,60 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	go func() {
-		requestsLimiter := semaphore.New(int(scMaxConcurrentPosts.roll()))
-		var requestCounter int64
+		var seq int64
+		var lastWrite time.Time
 
-		lastWrite := time.Now()
-
-		// by offloading the uploads into a buffered pipe, multiple conn.Write
-		// calls get automatically batched together into larger POST requests.
-		// without batching, bandwidth is extremely limited.
 		for {
+			wroteRequest := done.New()
+
+			ctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+				WroteRequest: func(httptrace.WroteRequestInfo) {
+					wroteRequest.Close()
+				},
+			})
+
+			// this intentionally makes a shallow-copy of the struct so we
+			// can reassign Path (potentially concurrently)
+			url := requestURL
+			url.Path += "/" + strconv.FormatInt(seq, 10)
+			// reassign query to get different padding
+			url.RawQuery = transportConfiguration.GetNormalizedQuery()
+
+			seq += 1
+
+			if scMinPostsIntervalMs.From > 0 {
+				sleep := time.Duration(scMinPostsIntervalMs.roll())*time.Millisecond - time.Since(lastWrite)
+				if sleep > 0 {
+					time.Sleep(sleep)
+				}
+			}
+
+			// by offloading the uploads into a buffered pipe, multiple conn.Write
+			// calls get automatically batched together into larger POST requests.
+			// without batching, bandwidth is extremely limited.
 			chunk, err := uploadPipeReader.ReadMultiBuffer()
 			if err != nil {
 				break
 			}
 
-			<-requestsLimiter.Wait()
-
-			seq := requestCounter
-			requestCounter += 1
+			lastWrite = time.Now()
 
 			go func() {
-				defer requestsLimiter.Signal()
-
-				// this intentionally makes a shallow-copy of the struct so we
-				// can reassign Path (potentially concurrently)
-				url := requestURL
-				url.Path += "/" + strconv.FormatInt(seq, 10)
-				// reassign query to get different padding
-				url.RawQuery = transportConfiguration.GetNormalizedQuery()
-
 				err := httpClient.SendUploadRequest(
 					context.WithoutCancel(ctx),
 					url.String(),
 					&buf.MultiBufferContainer{MultiBuffer: chunk},
 					int64(chunk.Len()),
 				)
+				wroteRequest.Close()
 				if err != nil {
 					errors.LogInfoInner(ctx, err, "failed to send upload")
 					uploadPipeReader.Interrupt()
 				}
 			}()
 
-			if scMinPostsIntervalMs.From > 0 {
-				roll := time.Duration(scMinPostsIntervalMs.roll()) * time.Millisecond
-				if time.Since(lastWrite) < roll {
-					time.Sleep(roll)
-				}
-
-				lastWrite = time.Now()
+			if _, ok := httpClient.(*DefaultDialerClient); ok {
+				<-wroteRequest.Wait()
 			}
 		}
 	}()
