@@ -2,10 +2,8 @@ package dokodemo
 
 import (
 	"context"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -14,11 +12,10 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -144,39 +141,11 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 	})
 	errors.LogInfo(ctx, "received request for ", conn.RemoteAddr())
 
-	plcy := d.policy()
-	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
-
-	if inbound != nil {
-		inbound.Timer = timer
-	}
-
-	ctx = policy.ContextWithBufferPolicy(ctx, plcy.Buffer)
-	link, err := dispatcher.Dispatch(ctx, dest)
-	if err != nil {
-		return errors.New("failed to dispatch request").Base(err)
-	}
-
-	requestCount := int32(1)
-	requestDone := func() error {
-		defer func() {
-			if atomic.AddInt32(&requestCount, -1) == 0 {
-				timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-			}
-		}()
-
-		var reader buf.Reader
-		if dest.Network == net.Network_UDP {
-			reader = buf.NewPacketReader(conn)
-		} else {
-			reader = buf.NewReader(conn)
-		}
-		if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to transport request").Base(err)
-		}
-
-		return nil
+	var reader buf.Reader
+	if dest.Network == net.Network_TCP {
+		reader = buf.NewReader(conn)
+	} else {
+		reader = buf.NewPacketReader(conn)
 	}
 
 	var writer buf.Writer
@@ -208,6 +177,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 				return err
 			}
 			writer = NewPacketWriter(pConn, &dest, mark, back)
+<<<<<<< HEAD
 <<<<<<< HEAD
 =======
 			defer func() {
@@ -269,19 +239,19 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 			return errors.New("failed to transport response").Base(err)
 		}
 		return nil
+=======
+			defer writer.(*PacketWriter).Close() // close fake UDP conns
+		}
 	}
 
-	if err := task.Run(ctx,
-		task.OnSuccess(func() error { return task.Run(ctx, requestDone) }, task.Close(link.Writer)),
-		responseDone); err != nil {
-		runtime.Gosched()
-		common.Interrupt(link.Writer)
-		runtime.Gosched()
-		common.Interrupt(link.Reader)
-		return errors.New("connection ends").Base(err)
+	if err := dispatcher.DispatchLink(ctx, dest, &transport.Link{
+		Reader: &buf.TimeoutWrapperReader{Reader: reader},
+		Writer: writer},
+	); err != nil {
+		return errors.New("failed to dispatch request").Base(err)
+>>>>>>> upstream/main
 	}
-
-	return nil
+	return nil // Unlike Dispatch(), DispatchLink() will not return until the outbound finishes Process()
 }
 
 func NewPacketWriter(conn net.PacketConn, d *net.Destination, mark int, back *net.UDPAddr) buf.Writer {
