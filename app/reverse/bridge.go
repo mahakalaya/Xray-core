@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
@@ -148,25 +149,23 @@ func (w *BridgeWorker) Connections() uint32 {
 }
 
 func (w *BridgeWorker) handleInternalConn(link *transport.Link) {
-	go func() {
-		reader := link.Reader
-		for {
-			mb, err := reader.ReadMultiBuffer()
-			if err != nil {
+	reader := link.Reader
+	for {
+		mb, err := reader.ReadMultiBuffer()
+		if err != nil {
+			break
+		}
+		for _, b := range mb {
+			var ctl Control
+			if err := proto.Unmarshal(b.Bytes(), &ctl); err != nil {
+				errors.LogInfoInner(context.Background(), err, "failed to parse proto message")
 				break
 			}
-			for _, b := range mb {
-				var ctl Control
-				if err := proto.Unmarshal(b.Bytes(), &ctl); err != nil {
-					errors.LogInfoInner(context.Background(), err, "failed to parse proto message")
-					break
-				}
-				if ctl.State != w.state {
-					w.state = ctl.State
-				}
+			if ctl.State != w.state {
+				w.state = ctl.State
 			}
 		}
-	}()
+	}
 }
 
 func (w *BridgeWorker) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
@@ -181,7 +180,7 @@ func (w *BridgeWorker) Dispatch(ctx context.Context, dest net.Destination) (*tra
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
-	w.handleInternalConn(&transport.Link{
+	go w.handleInternalConn(&transport.Link{
 		Reader: downlinkReader,
 		Writer: uplinkWriter,
 	})
@@ -200,6 +199,7 @@ func (w *BridgeWorker) DispatchLink(ctx context.Context, dest net.Destination, l
 		return w.dispatcher.DispatchLink(ctx, dest, link)
 	}
 
+	link = w.dispatcher.(*dispatcher.DefaultDispatcher).WrapLink(ctx, link)
 	w.handleInternalConn(link)
 
 	return nil
